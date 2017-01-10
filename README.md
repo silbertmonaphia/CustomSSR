@@ -8,8 +8,9 @@ sudo git clone -b	manyuser  https://github.com/silbertmonaphia/CustomSSR.git
 sudo ln -s /home/CustomSSR/rsstart.sh /usr/bin/rsstart  
 rsstart   
 ```
+#简单配置说明  
 
-rss_normal.json和rss_18+.json格式都如下(来源官网wiki)  
+rss_normal.json和rss_18+.json格式都如下(来源官网wiki)  
 ```
 {
     "server":"0.0.0.0",
@@ -37,8 +38,6 @@ rss_normal.json和rss_18+.json格式都如下(来源官网wiki)
 "password":"password",     //密码
 "method":"aes-256-cfb",    //加密方式
 "protocol": "auth_aes128_md5",    //协议
-```
-
-
+```  
 
 关于更多shadowsocksR的使用，请移步[官方github地址](https://github.com/shadowsocksr/shadowsocksr)
