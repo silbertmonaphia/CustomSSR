@@ -27,6 +27,7 @@ import binascii
 import traceback
 import random
 import platform
+import threading
 
 from shadowsocks import encrypt, obfs, eventloop, shell, common, lru_cache
 from shadowsocks.common import pre_parse_header, parse_header
@@ -312,7 +313,7 @@ class TCPRelayHandler(object):
                 if self._encrypt_correct:
                     if sock == self._remote_sock:
                         self._server.add_transfer_u(self._user, len(data))
-                        self._update_activity(len(data))
+                self._update_activity(len(data))
                 if data:
                     l = len(data)
                     s = sock.send(data)
@@ -846,8 +847,8 @@ class TCPRelayHandler(object):
                     data = self._protocol.server_pre_encrypt(data)
                     data = self._encryptor.encrypt(data)
                     data = self._obfs.server_encode(data)
-            self._update_activity(len(data))
-            self._server.add_transfer_d(self._user, len(data))
+                    self._server.add_transfer_d(self._user, len(data))
+                self._update_activity(len(data))
         else:
             return
         try:
@@ -879,26 +880,31 @@ class TCPRelayHandler(object):
             self._update_stream(STREAM_UP, WAIT_STATUS_READING)
 
     def _on_local_error(self):
-        logging.debug('got local error')
         if self._local_sock:
-            logging.error(eventloop.get_sock_error(self._local_sock))
-            logging.error("exception from %s:%d" % (self._client_address[0], self._client_address[1]))
+            err = eventloop.get_sock_error(self._local_sock)
+            if err.errno not in [errno.ECONNRESET, errno.EPIPE]:
+                logging.error(err)
+                logging.error("local error, exception from %s:%d" % (self._client_address[0], self._client_address[1]))
         self.destroy()
 
     def _on_remote_error(self):
-        logging.debug('got remote error')
         if self._remote_sock:
-            logging.error(eventloop.get_sock_error(self._remote_sock))
-            if self._remote_address:
-                logging.error("when connect to %s:%d" % (self._remote_address[0], self._remote_address[1]))
-            else:
-                logging.error("exception from %s:%d" % (self._client_address[0], self._client_address[1]))
+            err = eventloop.get_sock_error(self._remote_sock)
+            if err.errno not in [errno.ECONNRESET]:
+                logging.error(err)
+                if self._remote_address:
+                    logging.error("remote error, when connect to %s:%d" % (self._remote_address[0], self._remote_address[1]))
+                else:
+                    logging.error("remote error, exception from %s:%d" % (self._client_address[0], self._client_address[1]))
         self.destroy()
 
     def handle_event(self, sock, event):
         # handle all events in this handler and dispatch them to methods
         if self._stage == STAGE_DESTROYED:
             logging.debug('ignore handle_event: destroyed')
+            return
+        if self._user is not None and self._user not in self._server.server_users:
+            self.destroy()
             return
         # order is important
         if sock == self._remote_sock or sock == self._remote_sock_v6:
@@ -1000,6 +1006,8 @@ class TCPRelay(object):
         self.server_users = {}
         self.server_user_transfer_ul = {}
         self.server_user_transfer_dl = {}
+        self.update_users_protocol_param = None
+        self.update_users_acl = None
         self.server_connections = 0
         self.protocol_data = obfs.obfs(config['protocol']).init_data()
         self.obfs_data = obfs.obfs(config['obfs']).init_data()
@@ -1019,15 +1027,8 @@ class TCPRelay(object):
             listen_port = config['server_port']
         self._listen_port = listen_port
 
-        if config['protocol'] in ["auth_aes128_md5", "auth_aes128_sha1"]:
-            user_list = config['protocol_param'].split(',')
-            if user_list:
-                for user in user_list:
-                    items = user.split(':')
-                    if len(items) == 2:
-                        uid = struct.pack('<I', int(items[0]))
-                        passwd = items[1]
-                        self.add_user(uid, passwd)
+        if common.to_bytes(config['protocol']) in [b"auth_aes128_md5", b"auth_aes128_sha1"]:
+            self._update_users(None, None)
 
         addrs = socket.getaddrinfo(listen_addr, listen_port, 0,
                                    socket.SOCK_STREAM, socket.SOL_TCP)
@@ -1068,10 +1069,38 @@ class TCPRelay(object):
         self.server_connections += val
         logging.debug('server port %5d connections = %d' % (self._listen_port, self.server_connections,))
 
+    def get_ud(self):
+        return (self.server_transfer_ul, self.server_transfer_dl)
+
+    def get_users_ud(self):
+        return (self.server_user_transfer_ul.copy(), self.server_user_transfer_dl.copy())
+
+    def _update_users(self, protocol_param, acl):
+        if protocol_param is None:
+            protocol_param = self._config['protocol_param']
+        param = common.to_bytes(protocol_param).split(b'#')
+        if len(param) == 2:
+            user_list = param[1].split(b',')
+            if user_list:
+                for user in user_list:
+                    items = user.split(b':')
+                    if len(items) == 2:
+                        user_int_id = int(items[0])
+                        uid = struct.pack('<I', user_int_id)
+                        if acl is not None and user_int_id not in acl:
+                            self.del_user(uid)
+                        else:
+                            passwd = items[1]
+                            self.add_user(uid, passwd)
+
+    def update_users(self, protocol_param, acl):
+        self.update_users_protocol_param = protocol_param
+        self.update_users_acl = acl
+
     def add_user(self, user, passwd): # user: binstr[4], passwd: str
         self.server_users[user] = common.to_bytes(passwd)
 
-    def del_user(self, user, passwd):
+    def del_user(self, user):
         if user in self.server_users:
             del self.server_users[user]
 
@@ -1081,7 +1110,8 @@ class TCPRelay(object):
         else:
             if user not in self.server_user_transfer_ul:
                 self.server_user_transfer_ul[user] = 0
-            self.server_user_transfer_ul[user] += transfer
+            self.server_user_transfer_ul[user] += transfer + self.server_transfer_ul
+            self.server_transfer_ul = 0
 
     def add_transfer_d(self, user, transfer):
         if user is None:
@@ -1089,7 +1119,8 @@ class TCPRelay(object):
         else:
             if user not in self.server_user_transfer_dl:
                 self.server_user_transfer_dl[user] = 0
-            self.server_user_transfer_dl[user] += transfer
+            self.server_user_transfer_dl[user] += transfer + self.server_transfer_dl
+            self.server_transfer_dl = 0
 
     def update_stat(self, port, stat_dict, val):
         newval = stat_dict.get(0, 0) + val
@@ -1187,6 +1218,10 @@ class TCPRelay(object):
                 logging.info('closed TCP port %d', self._listen_port)
             for handler in list(self._fd_to_handlers.values()):
                 handler.destroy()
+        elif self.update_users_protocol_param is not None or self.update_users_acl is not None:
+            self._update_users(self.update_users_protocol_param, self.update_users_acl)
+            self.update_users_protocol_param = None
+            self.update_users_acl = None
         self._sweep_timeout()
 
     def close(self, next_tick=False):

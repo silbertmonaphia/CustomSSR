@@ -8,6 +8,7 @@ sudo git clone -b	manyuser  https://github.com/silbertmonaphia/CustomSSR.git
 sudo ln -s /home/CustomSSR/rsstart.sh /usr/bin/rsstart  
 rsstart   
 ```
+
 #简单配置说明  
 
 rss_normal.json和rss_18+.json格式都如下(来源官网wiki)  

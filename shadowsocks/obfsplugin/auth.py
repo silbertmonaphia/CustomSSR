@@ -1106,6 +1106,53 @@ class auth_aes128(auth_base):
             return (b'', None)
         return (data, None)
 
+class obfs_auth_mu_data(object):
+    def __init__(self):
+        self.user_id = {}
+        self.local_client_id = b''
+        self.connection_id = 0
+        self.set_max_client(64) # max active client count
+
+    def update(self, user_id, client_id, connection_id):
+        if user_id not in self.user_id:
+            self.user_id[user_id] = lru_cache.LRUCache()
+        local_client_id = self.user_id[user_id]
+
+        if client_id in local_client_id:
+            local_client_id[client_id].update()
+
+    def set_max_client(self, max_client):
+        self.max_client = max_client
+        self.max_buffer = max(self.max_client * 2, 1024)
+
+    def insert(self, user_id, client_id, connection_id):
+        if user_id not in self.user_id:
+            self.user_id[user_id] = lru_cache.LRUCache()
+        local_client_id = self.user_id[user_id]
+
+        if local_client_id.get(client_id, None) is None or not local_client_id[client_id].enable:
+            if local_client_id.first() is None or len(local_client_id) < self.max_client:
+                if client_id not in local_client_id:
+                    #TODO: check
+                    local_client_id[client_id] = client_queue(connection_id)
+                else:
+                    local_client_id[client_id].re_enable(connection_id)
+                return local_client_id[client_id].insert(connection_id)
+
+            if not local_client_id[local_client_id.first()].is_active():
+                del local_client_id[local_client_id.first()]
+                if client_id not in local_client_id:
+                    #TODO: check
+                    local_client_id[client_id] = client_queue(connection_id)
+                else:
+                    local_client_id[client_id].re_enable(connection_id)
+                return local_client_id[client_id].insert(connection_id)
+
+            logging.warn('auth_aes128: no inactive client')
+            return False
+        else:
+            return local_client_id[client_id].insert(connection_id)
+
 class auth_aes128_sha1(auth_base):
     def __init__(self, method, hashfunc):
         super(auth_aes128_sha1, self).__init__(method)
@@ -1123,15 +1170,16 @@ class auth_aes128_sha1(auth_base):
         self.extra_wait_size = struct.unpack('>H', os.urandom(2))[0] % 1024
         self.pack_id = 1
         self.recv_id = 1
+        self.user_id = None
         self.user_key = None
 
     def init_data(self):
-        return obfs_auth_v2_data()
+        return obfs_auth_mu_data()
 
     def set_server_info(self, server_info):
         self.server_info = server_info
         try:
-            max_client = int(server_info.protocol_param)
+            max_client = int(server_info.protocol_param.split('#')[0])
         except:
             max_client = 64
         self.server_info.data.set_max_client(max_client)
@@ -1174,9 +1222,16 @@ class auth_aes128_sha1(auth_base):
         data = data + struct.pack('<H', data_len) + struct.pack('<H', rnd_len)
         mac_key = self.server_info.iv + self.server_info.key
         uid = os.urandom(4)
-        #if self.user_key: uid = self.uid else:
-        self.user_key = self.server_info.key
-        encryptor = encrypt.Encryptor(to_bytes(base64.b64encode(self.server_info.key)) + self.salt, 'aes-128-cbc', b'\x00' * 16)
+        if b':' in to_bytes(self.server_info.protocol_param):
+            try:
+                items = to_bytes(self.server_info.protocol_param).split(b':')
+                self.user_key = self.hashfunc(items[1]).digest()
+                uid = struct.pack('<I', int(items[0]))
+            except:
+                pass
+        if self.user_key is None:
+            self.user_key = self.server_info.key
+        encryptor = encrypt.Encryptor(to_bytes(base64.b64encode(self.user_key)) + self.salt, 'aes-128-cbc', b'\x00' * 16)
         data = uid + encryptor.encrypt(data)[16:]
         data += hmac.new(mac_key, data, self.hashfunc).digest()[:4]
         check_head = os.urandom(1)
@@ -1282,7 +1337,8 @@ class auth_aes128_sha1(auth_base):
 
             uid = self.recv_buf[7:11]
             if uid in self.server_info.users:
-                self.user_key = self.server_info.users[uid]
+                self.user_id = uid
+                self.user_key = self.hashfunc(self.server_info.users[uid]).digest()
                 self.server_info.update_user_func(uid)
             else:
                 if not self.server_info.users:
@@ -1306,7 +1362,7 @@ class auth_aes128_sha1(auth_base):
             if time_dif < -self.max_time_dif or time_dif > self.max_time_dif:
                 logging.info('%s: wrong timestamp, time_dif %d, data %s' % (self.no_compatible_method, time_dif, binascii.hexlify(head)))
                 return self.not_match_return(self.recv_buf)
-            elif self.server_info.data.insert(client_id, connection_id):
+            elif self.server_info.data.insert(self.user_id, client_id, connection_id):
                 self.has_recv_header = True
                 out_buf = self.recv_buf[31 + rnd_len:length - 4]
                 self.client_id = client_id
@@ -1362,14 +1418,23 @@ class auth_aes128_sha1(auth_base):
                 sendback = True
 
         if out_buf:
-            self.server_info.data.update(self.client_id, self.connection_id)
+            self.server_info.data.update(self.user_id, self.client_id, self.connection_id)
         return (out_buf, sendback)
 
     def client_udp_pre_encrypt(self, buf):
-        uid = os.urandom(4)
-        user_key = self.server_info.key
-        buf += uid
-        return buf + hmac.new(user_key, buf, self.hashfunc).digest()[:4]
+        if self.user_key is None:
+            if b':' in to_bytes(self.server_info.protocol_param):
+                try:
+                    items = to_bytes(self.server_info.protocol_param).split(':')
+                    self.user_key = self.hashfunc(items[1]).digest()
+                    self.user_id = struct.pack('<I', int(items[0]))
+                except:
+                    pass
+            if self.user_key is None:
+                self.user_id = os.urandom(4)
+                self.user_key = self.server_info.key
+        buf += self.user_id
+        return buf + hmac.new(self.user_key, buf, self.hashfunc).digest()[:4]
 
     def client_udp_post_decrypt(self, buf):
         user_key = self.server_info.key
@@ -1384,14 +1449,14 @@ class auth_aes128_sha1(auth_base):
     def server_udp_post_decrypt(self, buf):
         uid = buf[-8:-4]
         if uid in self.server_info.users:
-            self.user_key = self.server_info.users[uid]
+            user_key = self.hashfunc(self.server_info.users[uid]).digest()
         else:
             uid = None
             if not self.server_info.users:
-                self.user_key = self.server_info.key
+                user_key = self.server_info.key
             else:
-                self.user_key = self.server_info.recv_iv
-        if hmac.new(self.user_key, buf[:-4], self.hashfunc).digest()[:4] != buf[-4:]:
+                user_key = self.server_info.recv_iv
+        if hmac.new(user_key, buf[:-4], self.hashfunc).digest()[:4] != buf[-4:]:
             return (b'', None)
         return (buf[:-8], uid)
 
